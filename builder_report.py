@@ -70,7 +70,6 @@ FEED_STALE_H = int(os.getenv("BUILDER_FEED_STALE_H", "36"))
 PER_BUILDER_CAP = int(os.getenv("BUILDER_PER_ACCOUNT_CAP", "4"))
 
 FEISHU_WEBHOOK = os.getenv("FEISHU_WEBHOOK", "")
-FEISHU_SECRET = os.getenv("FEISHU_SECRET") or None
 
 write_log = make_logger(LOG_FILE, JSONL_FILE)
 save_pending = make_pending_saver(CACHE_FILE)
@@ -232,7 +231,7 @@ def run_send(draft_path: Path) -> int:
     return send_x_linked_report(
         draft_path,
         log_file=LOG_FILE, cache_file=CACHE_FILE, fetch_meta=FETCH_META,
-        sent_urls=SENT_URLS, webhook=FEISHU_WEBHOOK, secret=FEISHU_SECRET,
+        sent_urls=SENT_URLS, webhook=FEISHU_WEBHOOK,
         write_log=write_log, save_pending=save_pending,
         link_label="原推")
 
