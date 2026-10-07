@@ -76,7 +76,6 @@ send 有一道硬闸门：稿件里没有任何 `x.com/<user>/status/<id>` 原�
 | 变量 | 用途 |
 |---|---|
 | `FEISHU_WEBHOOK` | 填 AI 产业日报那个群机器人的地址（三块共用） |
-| `FEISHU_ALERT_WEBHOOK` | 运维告警走的监测机器人，不进日报群 |
 | `HTTP_PROXY` / `HTTPS_PROXY` | 拉 raw.githubusercontent.com 必须 |
 | `BUILDER_FEED_URL` | 覆盖 feed 地址，一般不用 |
 | `BUILDER_FEED_STALE_H` | 滞后告警阈值，默认 36 |
