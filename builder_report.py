@@ -37,14 +37,17 @@ AI Builder 日报
 """
 
 import argparse
+import html
 import json
 import os
+import re
 import sys
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "shared"))
 from bot_utils import (already_ran_today, load_sent_urls, url_key,
+                       fetch_rss, parse_entry_date, X_POST_RE,
                        make_logger, make_pending_saver, proxy_ok,
                        emit_fetch_output, send_x_linked_report)
 
@@ -63,11 +66,52 @@ SENT_URLS = BASE / "logs" / "sent_urls.json"
 FEED_URL = os.getenv(
     "BUILDER_FEED_URL",
     "https://raw.githubusercontent.com/zarazhangrui/follow-builders/main/feed-x.json")
+FEED_BLOGS_URL = os.getenv(
+    "BUILDER_BLOGS_URL",
+    "https://raw.githubusercontent.com/zarazhangrui/follow-builders/main/feed-blogs.json")
 # feed 比这个小时数还旧就打 FEED_STALE 标记。上游 14:17 生成、我们 15:00 取，
 # 正常滞后约 1h；阈值定在 36h 说明上游 CI 真的断了一整天。
 FEED_STALE_H = int(os.getenv("BUILDER_FEED_STALE_H", "36"))
 # 每位 builder 最多进多少条，避免话痨账号刷屏挤掉其他人
 PER_BUILDER_CAP = int(os.getenv("BUILDER_PER_ACCOUNT_CAP", "4"))
+
+# 从上游 follow-builders 名单中剔除的 8 个非一线个人 Builder 账号：
+# - 类别 B（官方机构宣传号）：claudeai, googlelabs
+# - 类别 C 前三位（纯 VC 投资人）：mattturck, adityaag, nikunj
+# - 类别 D 三位（维护者/教程博主）：zarazhangrui, petergyang, danshipper
+EXCLUDED_HANDLES = {
+    "claudeai", "googlelabs",
+    "mattturck", "adityaag", "nikunj",
+    "zarazhangrui", "petergyang", "danshipper",
+}
+
+# 渠道 ②：从 AINews (latent.space/feed) 544 个 X 账号池中定向捞取的扩充 Builder 白名单
+EXTRA_BUILDERS = {
+    "noamshazeer": ("Noam Shazeer", "Character.AI 创始人 / Google Gemini 联创，Transformer 作者"),
+    "polynoamial": ("Noam Brown", "OpenAI 多步推理研究科学家"),
+    "drjimfan": ("Jim Fan", "NVIDIA 具身智能 GEAR Lab 负责人"),
+    "ylecun": ("Yann LeCun", "Meta 首席 AI 科学家"),
+    "sholtodouglas": ("Sholto Douglas", "Anthropic 研究员，专注 Scaling 与强化学习"),
+    "trentonbricken": ("Trenton Bricken", "Anthropic 机械可解释性研究员"),
+    "soumithchintala": ("Soumith Chintala", "PyTorch 联创"),
+    "simonw": ("Simon Willison", "Datasette 创始人 / 独立 AI 工具构建者"),
+    "mitchellh": ("Mitchell Hashimoto", "Ghostty / HashiCorp 创始人"),
+    "hamelhusain": ("Hamel Husain", "Parlance Labs 创始人 / AI Evals 专家"),
+    "eugeneyan": ("Eugene Yan", "Amazon 资深应用科学家"),
+    "clementdelangue": ("Clément Delangue", "Hugging Face CEO"),
+    "hwchase17": ("Harrison Chase", "LangChain 创始人"),
+    "jerryjliu0": ("Jerry Liu", "LlamaIndex 创始人"),
+    "aravindsrinivas": ("Aravind Srinivas", "Perplexity CEO"),
+}
+
+# 渠道 ③：一线 AI Builder 个人技术博客直连 RSS（48h 窗口）
+BUILDER_BLOG_FEEDS = [
+    ("Simon Willison (@simonw)", "https://simonwillison.net/atom/everything/", 4),
+    ("Lilian Weng (@lilianweng)", "https://lilianweng.github.io/index.xml", 2),
+    ("Hamel Husain (@HamelHusain)", "https://hamel.dev/index.xml", 2),
+    ("Armin Ronacher (@mitsuhiko)", "https://lucumr.pocoo.org/feed.atom", 2),
+    ("Eugene Yan (@eugeneyan)", "https://eugeneyan.com/rss/", 2),
+]
 
 FEISHU_WEBHOOK = os.getenv("FEISHU_WEBHOOK", "")
 
@@ -83,6 +127,9 @@ def _proxy_ok() -> bool:
     raw.githubusercontent.com 在国内直连基本不通，这一步是硬前置。"""
     global _PROXY
     ok, _PROXY = proxy_ok(_PROXY, _SESSION)
+    if ok and _PROXY:
+        os.environ["HTTP_PROXY"] = _PROXY
+        os.environ["HTTPS_PROXY"] = _PROXY
     return ok
 
 
@@ -94,10 +141,176 @@ def _iso(s: str):
         return None
 
 
+_TAG_RE = re.compile(r"(?s)<[^>]+>")
+_ANCHOR_RE = re.compile(r'(?is)<a\b[^>]*href=["\']([^"\']*)["\'][^>]*>(.*?)</a>')
+
+
+def _plain_text(fragment: str, limit: int = 0) -> str:
+    text = re.sub(r"(?i)<br\s*/?>", "\n", fragment or "")
+    text = re.sub(r"(?i)</(p|li|div|h[1-6])>", "\n", text)
+    text = _TAG_RE.sub("", text)
+    text = html.unescape(text)
+    text = re.sub(r"[ \t]+", " ", text)
+    text = re.sub(r"\n{3,}", "\n\n", text).strip()
+    return text[:limit] if limit else text
+
+
+def _fetch_extra_builder_tweets(sent_before: set, existing_urls: set) -> list:
+    """渠道 ②：从 latent.space/feed 的 [AINews] 期刊中提取 EXTRA_BUILDERS 白名单原推及上下文。"""
+    extra_rows = []
+    try:
+        entries = fetch_rss("https://www.latent.space/feed", limit=10)
+        entries = [e for e in entries
+                   if "[ainews]" in (getattr(e, "title", "") or "").lower()]
+        cutoff = datetime.now(timezone.utc) - timedelta(hours=48)
+        for e in entries[:2]:
+            dt = parse_entry_date(e)
+            if dt and dt < cutoff:
+                continue
+            body = ""
+            for item in (getattr(e, "content", None) or []):
+                val = item.get("value") if isinstance(item, dict) else getattr(item, "value", "")
+                if val and len(val) > 2000:
+                    body = val
+                    break
+            if not body:
+                body = getattr(e, "summary", "") or ""
+            if not body:
+                continue
+
+            # 定位白名单原推并截取周围上下文
+            hits = {}
+            order = []
+            for m in X_POST_RE.finditer(body):
+                h_raw, pid = m.group(1), m.group(2)
+                h_low = h_raw.lower()
+                if h_low not in EXTRA_BUILDERS:
+                    continue
+                url = f"https://x.com/{h_raw}/status/{pid}"
+                uk = url_key(url)
+                if uk in sent_before or uk in existing_urls:
+                    continue
+                if pid not in hits:
+                    hits[pid] = {
+                        "handle": h_raw,
+                        "url": url,
+                        "idx": len(order),
+                        "createdAt": dt.isoformat() if dt else "",
+                    }
+                    order.append(pid)
+
+            if not hits:
+                continue
+
+            def _mark_anchor(m):
+                href, inner = m.group(1), m.group(2)
+                hit = X_POST_RE.search(href)
+                if not hit or hit.group(2) not in hits:
+                    return inner
+                return f"{inner} ⟦EB{hits[hit.group(2)]['idx']}⟧ "
+
+            marked = _ANCHOR_RE.sub(_mark_anchor, body)
+            plain = _plain_text(marked)
+            for pid in order:
+                info = hits[pid]
+                token = f"⟦EB{info['idx']}⟧"
+                pos = plain.find(token)
+                if pos >= 0:
+                    left = max(0, pos - 200)
+                    snippet = plain[left:pos] + plain[pos + len(token):pos + len(token) + 80]
+                    snippet = re.sub(r"⟦EB\d+⟧", "", snippet).strip()
+                else:
+                    snippet = ""
+                if len(snippet) < 25:
+                    continue
+                name, bio = EXTRA_BUILDERS[info["handle"].lower()]
+                existing_urls.add(url_key(info["url"]))
+                extra_rows.append({
+                    "handle": info["handle"],
+                    "name": name,
+                    "bio": bio,
+                    "url": info["url"],
+                    "text": f"[AINews 摘录上下文] {snippet}",
+                    "createdAt": info["createdAt"],
+                    "likes": 0,
+                    "retweets": 0,
+                    "replies": 0,
+                    "isQuote": False,
+                    "from_ainews": True,
+                })
+    except Exception as exc:
+        print(f"[WARN] EXTRA_BUILDERS 渠道抓取异常（不阻断主流程）: {exc}", file=sys.stderr)
+    return extra_rows
+
+
+def _fetch_builder_blogs(sent_before: set) -> list:
+    """渠道 ①（follow-builders feed-blogs.json）+ 渠道 ③（Builder 个人博客直连 RSS，48h 窗口）。"""
+    blog_items = []
+    seen = set()
+    cutoff = datetime.now(timezone.utc) - timedelta(hours=48)
+
+    # 渠道 ①：follow-builders 的 feed-blogs.json
+    try:
+        r = _SESSION.get(FEED_BLOGS_URL, timeout=15)
+        if r.status_code == 200:
+            data = r.json()
+            for item in data.get("blogs", []):
+                if not isinstance(item, dict):
+                    continue
+                url = item.get("url") or item.get("link") or ""
+                title = (item.get("title") or "").strip()
+                if not url or not title:
+                    continue
+                uk = url_key(url)
+                if uk in sent_before or uk in seen:
+                    continue
+                seen.add(uk)
+                src = item.get("source") or item.get("author") or "Official AI Blog"
+                summary = _plain_text(item.get("summary") or item.get("description") or item.get("content") or "", 320)
+                blog_items.append({
+                    "author": src,
+                    "title": title,
+                    "url": url,
+                    "date": (item.get("publishedAt") or item.get("date") or "")[:16],
+                    "summary": summary,
+                })
+    except Exception as exc:
+        print(f"[WARN] feed-blogs.json 抓取异常: {exc}", file=sys.stderr)
+
+    # 渠道 ③：Builder 个人博客直连 RSS
+    for author_label, feed_url, limit in BUILDER_BLOG_FEEDS:
+        try:
+            entries = fetch_rss(feed_url, limit=limit)
+            for e in entries:
+                dt = parse_entry_date(e)
+                if dt and dt < cutoff:
+                    continue
+                url = getattr(e, "link", "") or getattr(e, "id", "")
+                title = (getattr(e, "title", "") or "").strip()
+                if not url or not title:
+                    continue
+                uk = url_key(url)
+                if uk in sent_before or uk in seen:
+                    continue
+                seen.add(uk)
+                summary = _plain_text(getattr(e, "summary", "") or "", 320)
+                blog_items.append({
+                    "author": author_label,
+                    "title": title,
+                    "url": url,
+                    "date": dt.strftime("%Y-%m-%d %H:%M UTC") if dt else "",
+                    "summary": summary,
+                })
+        except Exception as exc:
+            print(f"[WARN] Builder 博客 {feed_url} 抓取异常: {exc}", file=sys.stderr)
+
+    return blog_items
+
+
 # ===== 取材 =====
 
 def gather() -> tuple:
-    """拉 feed → 跨天去重 → 按互动量排序，返回 (context, metrics)。"""
+    """拉 feed → 剔除非个人噪音号 → 补充三路扩充源 → 跨天去重 → 按互动量排序，返回 (context, metrics, lag_h)。"""
     r = _SESSION.get(FEED_URL, timeout=30)
     r.raise_for_status()
     feed = r.json()
@@ -107,10 +320,16 @@ def gather() -> tuple:
     lookback = feed.get("lookbackHours", 24)
 
     sent_before = load_sent_urls(SENT_URLS)
-    rows, dropped_dup, dropped_cap = [], 0, 0
+    rows, dropped_dup, dropped_cap, dropped_excluded = [], 0, 0, 0
+    existing_urls = set()
+    kept_builders = 0
 
     for acct in feed.get("x", []):
         handle = acct.get("handle", "")
+        if handle.lower().lstrip("@") in EXCLUDED_HANDLES:
+            dropped_excluded += 1
+            continue
+        kept_builders += 1
         name = acct.get("name", "")
         bio = (acct.get("bio", "") or "")[:80]
         kept_this = 0
@@ -121,13 +340,15 @@ def gather() -> tuple:
             url = t.get("url", "")
             if not url:
                 continue
-            if url_key(url) in sent_before:
+            uk = url_key(url)
+            if uk in sent_before or uk in existing_urls:
                 dropped_dup += 1
                 continue
             if kept_this >= PER_BUILDER_CAP:
                 dropped_cap += 1
                 continue
             kept_this += 1
+            existing_urls.add(uk)
             rows.append({
                 "handle": handle, "name": name, "bio": bio, "url": url,
                 "text": (t.get("text", "") or "").strip(),
@@ -136,12 +357,20 @@ def gather() -> tuple:
                 "retweets": t.get("retweets", 0) or 0,
                 "replies": t.get("replies", 0) or 0,
                 "isQuote": bool(t.get("isQuote")),
+                "from_ainews": False,
             })
 
     # 全局按点赞排序：Claude 先看到讨论最热的，写稿时好定详略
     rows.sort(key=lambda x: -x["likes"])
 
-    times = [_iso(x["createdAt"]) for x in rows]
+    # 渠道 ②：补充 EXTRA_BUILDERS 原推
+    extra_rows = _fetch_extra_builder_tweets(sent_before, existing_urls)
+    rows.extend(extra_rows)
+
+    # 渠道 ① + ③：补充官方 Engineering 博客与个人技术博客（48h 内新文）
+    blog_rows = _fetch_builder_blogs(sent_before)
+
+    times = [_iso(x["createdAt"]) for x in rows if not x.get("from_ainews")]
     times = [t for t in times if t]
     span = (f"{min(times).strftime('%Y-%m-%d %H:%M')} ~ "
             f"{max(times).strftime('%Y-%m-%d %H:%M')} UTC") if times else "无"
@@ -150,26 +379,46 @@ def gather() -> tuple:
         f"【feed 生成时间】{generated.strftime('%Y-%m-%d %H:%M')} UTC"
         f"（距现在 {lag_h} 小时，上游回看窗口 {lookback}h）",
         f"【推文实际时间区间】{span}",
-        f"【本次可用推文】{len(rows)} 条 / {len(feed.get('x', []))} 位 builder"
-        f"（跨天已播过滤掉 {dropped_dup} 条，单人上限滤掉 {dropped_cap} 条）",
+        f"【本次可用推文】{len(rows)} 条（主源 {kept_builders} 位 builder，已剔除 {dropped_excluded} 个机构/VC/教程号；"
+        f"扩充渠道额外命中 {len(extra_rows)} 条原推 + {len(blog_rows)} 篇博客；"
+        f"跨天已播过滤掉 {dropped_dup} 条，单人上限滤掉 {dropped_cap} 条）",
         "",
-        "⚠️ 下面的 赞/转/回 是 X 上的真实互动量，可以照实写。",
+        "⚠️ 主源推文的 赞/转/回 是 X 上的真实互动量，可以照实写；来自 [AINews 摘录上下文] 的扩充推文未附互动量数字，不要编造赞数。",
         "",
     ]
     for i, x in enumerate(rows, 1):
         when = _iso(x["createdAt"])
         when_s = when.strftime("%m-%d %H:%M UTC") if when else x["createdAt"]
         lines.append(f"--- {i}. @{x['handle']}（{x['name']}｜{x['bio']}）")
-        lines.append(f"[时间] {when_s}"
-                     f"　[赞] {x['likes']}　[转] {x['retweets']}　[回] {x['replies']}"
-                     + ("　[引用推]" if x["isQuote"] else ""))
+        if x.get("from_ainews"):
+            lines.append(f"[时间] {when_s}　[来源] AINews 扩充白名单（无互动量统计）")
+        else:
+            lines.append(f"[时间] {when_s}"
+                         f"　[赞] {x['likes']}　[转] {x['retweets']}　[回] {x['replies']}"
+                         + ("　[引用推]" if x["isQuote"] else ""))
         lines.append(f"[原推] {x['url']}")
         lines.append(f"[正文] {x['text']}")
         lines.append("")
 
+    if blog_rows:
+        lines.append("=== BUILDER_BLOGS_BEGIN ===")
+        lines.append(f"【Builder 深度长文 / 官方工程博客（48h 内新发，共 {len(blog_rows)} 篇）】")
+        lines.append("（注：长文可作为独立条目或补充印证写进日报，引用时附上对应链接；全篇仍须保证至少带一条 x.com 原推直链）")
+        lines.append("")
+        for j, b in enumerate(blog_rows, 1):
+            lines.append(f"--- [Blog {j}] {b['author']}：《{b['title']}》")
+            lines.append(f"[时间] {b['date']}　[链接] {b['url']}")
+            if b["summary"]:
+                lines.append(f"[摘要] {b['summary']}")
+            lines.append("")
+        lines.append("=== BUILDER_BLOGS_END ===")
+
     metrics = {
         "tweets": len(rows),
-        "builders": len(feed.get("x", [])),
+        "builders": kept_builders,
+        "extra_tweets": len(extra_rows),
+        "blogs": len(blog_rows),
+        "dropped_excluded": dropped_excluded,
         "dropped_dup": dropped_dup,
         "dropped_cap": dropped_cap,
         "feed_lag_h": lag_h,
