@@ -16,9 +16,9 @@ AI Builder 日报
 ━━━ 三条改动前必读的约束 ━━━
 
 1. **feed 的生成时间比我们早不了多少，务必照实交代。**
-   上游 CI 是 `17 6 * * *` UTC，即北京时间 14:17 生成当天的 feed。而 routine 是
-   北京时间 10:00 跑，那时当天的 feed 还没出，我们拿到的永远是**前一天 14:17**
-   生成的那份，覆盖的是前天下午到昨天下午这 24 小时。
+   上游 CI 是 `17 6 * * *` UTC，即北京时间 14:17 生成当天的 feed。而 routine 已于 2026-09-04 改到
+   北京时间 15:00 跑，正常情况下拿到的就是**当天 14:17** 刚生成的那份（滞后约 45 分钟），
+   覆盖昨天下午到今天下午这 24 小时。
    所以稿子开头必须写清这批推文发生在哪一天，不能写成「今天」。
    fetch 会把 feed 的 generatedAt、推文实际时间区间、滞后小时数一并打进 context；
    滞后超过 FEED_STALE_H 还会额外给一个 === FEED_STALE === 标记。
@@ -63,8 +63,8 @@ SENT_URLS = BASE / "logs" / "sent_urls.json"
 FEED_URL = os.getenv(
     "BUILDER_FEED_URL",
     "https://raw.githubusercontent.com/zarazhangrui/follow-builders/main/feed-x.json")
-# feed 比这个小时数还旧就打 FEED_STALE 标记。上游 14:17 生成、我们 10:00 取，
-# 正常滞后就有 ~20h，所以阈值定在 36h——那才说明上游 CI 真的断了一天。
+# feed 比这个小时数还旧就打 FEED_STALE 标记。上游 14:17 生成、我们 15:00 取，
+# 正常滞后约 1h；阈值定在 36h 说明上游 CI 真的断了一整天。
 FEED_STALE_H = int(os.getenv("BUILDER_FEED_STALE_H", "36"))
 # 每位 builder 最多进多少条，避免话痨账号刷屏挤掉其他人
 PER_BUILDER_CAP = int(os.getenv("BUILDER_PER_ACCOUNT_CAP", "4"))
