@@ -11,7 +11,7 @@ Follow-Builders Feed (X + Blogs) + Curated Builder Whitelist + Personal RSS
 1. Fetch & Filter (builder_report.py --mode fetch)
   ├─ Pull daily feed generated at 14:17 CST (covering the past 24 hours)
   ├─ Filter out institutional/VC/tutorial noise accounts (EXCLUDED_HANDLES)
-  ├─ Supplement with 25 whitelisted builders from AINews & 5 personal engineering blogs
+  ├─ Supplement with 15 whitelisted builders from AINews & 5 personal engineering blogs
   └─ Deduplicate against 7-day sent history (sent_urls.json) & apply per-author caps
   │
   ▼
@@ -24,7 +24,7 @@ Follow-Builders Feed (X + Blogs) + Curated Builder Whitelist + Personal RSS
 3. Validate & Deliver (builder_report.py --mode send)
   ├─ Enforce hard gate: require valid x.com/<user>/status/<id> original tweet links
   ├─ Convert to Feishu card Markdown & auto-paginate if needed
-  └─ Push to Feishu webhook & archive sent tweet URLs
+  └─ Push to Feishu webhook, archive to Notion, and store sent tweet URLs
 ```
 
 ## Operation

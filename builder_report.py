@@ -2,13 +2,13 @@
 """
 AI Builder 日报
 
-每天把 X 上十几位 AI builder（研究员 / 创始人 / 产品 / 工程）本人发的推文整理成一份
-播报，**每条都带原推直链**，由 Claude 写稿后推送到飞书。本脚本只负责取材与推送，
+每天把 X 上一线 AI builder（研究员 / 创始人 / 产品 / 工程）本人发的推文与技术长文整理成一份
+播报，**每条话题都带原推直链**，由 AI 定时任务写稿后推送到飞书并归档至 Notion。本脚本只负责取材与推送，
 不含写稿用的第三方大模型 API。
 
 两种运行模式（--mode，均零 API 成本）：
-- fetch：拉 follow-builders 公共 feed → 把 context 打到 stdout（供 Claude routine 写稿）
-- send ：读取 Claude 写好的稿子文件 → 清洗 HTML → 推送飞书 + 写日志
+- fetch：拉 follow-builders 公共 feed → 把 context 打到 stdout（并落盘 logs/last_context.txt）
+- send ：读取写好的稿子文件 → 清洗 HTML → 推送飞书 + 同步 Notion + 写日志
 
 素材来源：zarazhangrui/follow-builders 仓库里由 GitHub Actions 每天生成的静态 feed。
 **零 API key、零依赖**，就是一个 raw.githubusercontent.com 上的 JSON。
@@ -33,7 +33,7 @@ AI Builder 日报
    上游 CI 万一某天没跑成，raw 上还是昨天那份 feed，不去重就会把同一批推文
    再播一遍。这道闸门是必须的，不是锦上添花。
 
-写稿规范在同目录 prompt.md，由 Claude routine 读取。
+写稿规范在同目录 prompt.md，由 Antigravity Sidecar 定时任务读取。
 """
 
 import argparse
@@ -360,7 +360,7 @@ def gather() -> tuple:
                 "from_ainews": False,
             })
 
-    # 全局按点赞排序：Claude 先看到讨论最热的，写稿时好定详略
+    # 全局按点赞排序：让写稿方先看到讨论最热的，好定详略
     rows.sort(key=lambda x: -x["likes"])
 
     # 渠道 ②：补充 EXTRA_BUILDERS 原推
@@ -370,7 +370,7 @@ def gather() -> tuple:
     # 渠道 ① + ③：补充官方 Engineering 博客与个人技术博客（48h 内新文）
     blog_rows = _fetch_builder_blogs(sent_before)
 
-    times = [_iso(x["createdAt"]) for x in rows if not x.get("from_ainews")]
+    times = [_iso(x["createdAt"]) for x in rows]
     times = [t for t in times if t]
     span = (f"{min(times).strftime('%Y-%m-%d %H:%M')} ~ "
             f"{max(times).strftime('%Y-%m-%d %H:%M')} UTC") if times else "无"
@@ -449,7 +449,12 @@ def run_fetch() -> int:
 
     if metrics["tweets"] == 0:
         print("=== NO_TWEETS ===")
-        write_log("WARN", "feed 里没有可用的新推文（多半是上游 CI 未更新），未发送")
+        extra_blog_note = (
+            f"（另有 {metrics.get('blogs', 0)} 篇博客新文，但缺少 x.com 原推直链，按出稿硬门禁未发送）"
+            if metrics.get("blogs", 0) > 0
+            else "（多半是上游 CI 未更新）"
+        )
+        write_log("WARN", f"feed 里没有可用的新推文{extra_blog_note}，未发送")
         return 0
 
     FETCH_META.write_text(json.dumps(
