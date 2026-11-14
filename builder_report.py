@@ -483,6 +483,7 @@ def run_fetch() -> int:
     FETCH_META.write_text(json.dumps(
         {"log_summary": f"builder {metrics['builders']} 位 / 推文 {metrics['tweets']} 条"
                         f"（feed 滞后 {lag_h}h）",
+         "fetch_date": datetime.now().strftime("%Y-%m-%d"),
          "metrics": metrics}, ensure_ascii=False), encoding="utf-8")
 
     out = ["=== FETCH_OK ===",
