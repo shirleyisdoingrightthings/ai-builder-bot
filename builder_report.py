@@ -235,7 +235,9 @@ def _fetch_extra_builder_tweets(sent_before: set, existing_urls: set) -> list:
                         if ruk not in seen_r:
                             seen_r.add(ruk)
                             refs.append((rlbl, rurl))
-                    snippet = re.sub(r"⟦E[BL]\d+⟧", "", raw_snip).strip()
+                    snippet = re.sub(r"⟦E[BL]\d+⟧", "", raw_snip)
+                    snippet = re.sub(r"^[^⟦]{0,12}⟧", "", snippet)
+                    snippet = re.sub(r"⟦[^⟧]*$", "", snippet).strip()
                 else:
                     snippet, refs = "", []
                 if len(snippet) < 25:
