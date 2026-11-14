@@ -202,12 +202,22 @@ def _fetch_extra_builder_tweets(sent_before: set, existing_urls: set) -> list:
             if not hits:
                 continue
 
+            ref_links = []
+
             def _mark_anchor(m):
-                href, inner = m.group(1), m.group(2)
+                href, inner = (m.group(1) or "").strip(), m.group(2) or ""
                 hit = X_POST_RE.search(href)
-                if not hit or hit.group(2) not in hits:
-                    return inner
-                return f"{inner} ⟦EB{hits[hit.group(2)]['idx']}⟧ "
+                if hit and hit.group(2) in hits:
+                    return f"{inner} ⟦EB{hits[hit.group(2)]['idx']}⟧ "
+                label = _plain_text(inner)
+                if label and href.startswith(("http://", "https://")):
+                    low = href.lower().split("?", 1)[0]
+                    if not (any(h in low for h in ("substackcdn.com", "pbs.twimg.com")) and low.endswith((".png", ".jpg", ".jpeg", ".gif", ".webp"))):
+                        clean_href = f"https://x.com/{hit.group(1)}/status/{hit.group(2)}" if hit else href
+                        idx = len(ref_links)
+                        ref_links.append((label, clean_href))
+                        return f"{inner} ⟦EL{idx}⟧ "
+                return inner
 
             marked = _ANCHOR_RE.sub(_mark_anchor, body)
             plain = _plain_text(marked)
@@ -217,10 +227,17 @@ def _fetch_extra_builder_tweets(sent_before: set, existing_urls: set) -> list:
                 pos = plain.find(token)
                 if pos >= 0:
                     left = max(0, pos - 200)
-                    snippet = plain[left:pos] + plain[pos + len(token):pos + len(token) + 80]
-                    snippet = re.sub(r"⟦EB\d+⟧", "", snippet).strip()
+                    raw_snip = plain[left:pos] + plain[pos + len(token):pos + len(token) + 80]
+                    seen_r, refs = {url_key(info["url"])}, []
+                    for rm in re.finditer(r"⟦EL(\d+)⟧", raw_snip):
+                        rlbl, rurl = ref_links[int(rm.group(1))]
+                        ruk = url_key(rurl)
+                        if ruk not in seen_r:
+                            seen_r.add(ruk)
+                            refs.append((rlbl, rurl))
+                    snippet = re.sub(r"⟦E[BL]\d+⟧", "", raw_snip).strip()
                 else:
-                    snippet = ""
+                    snippet, refs = "", []
                 if len(snippet) < 25:
                     continue
                 name, bio = EXTRA_BUILDERS[info["handle"].lower()]
@@ -230,6 +247,7 @@ def _fetch_extra_builder_tweets(sent_before: set, existing_urls: set) -> list:
                     "name": name,
                     "bio": bio,
                     "url": info["url"],
+                    "ref_links": refs,
                     "text": f"[AINews 摘录上下文] {snippet}",
                     "createdAt": info["createdAt"],
                     "likes": 0,
@@ -397,6 +415,9 @@ def gather() -> tuple:
                          f"　[赞] {x['likes']}　[转] {x['retweets']}　[回] {x['replies']}"
                          + ("　[引用推]" if x["isQuote"] else ""))
         lines.append(f"[原推] {x['url']}")
+        if x.get("ref_links"):
+            ref_s = " | ".join(f"{lbl} -> {u}" for lbl, u in x["ref_links"])
+            lines.append(f"[引用链接] {ref_s}")
         lines.append(f"[正文] {x['text']}")
         lines.append("")
 
