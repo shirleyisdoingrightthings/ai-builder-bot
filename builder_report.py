@@ -22,8 +22,10 @@ import os
 import plistlib
 import re
 import sys
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from urllib.parse import urlsplit
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "shared"))
 from bot_utils import (already_ran_today, load_sent_urls, url_key,
@@ -31,7 +33,9 @@ from bot_utils import (already_ran_today, load_sent_urls, url_key,
                        emit_fetch_output, send_x_linked_report,
                        sanitize_html, extract_hrefs, X_POST_RE,
                        extract_report_date, archive_and_sync_notion,
-                       record_sent_urls)
+                       record_sent_urls, fetch_article_text,
+                       load_daily_ledger, record_daily_ledger,
+                       format_ledger_context)
 
 BASE = Path(__file__).parent
 LOG_FILE = BASE / "logs" / "run.log"
@@ -128,10 +132,16 @@ def _cookie_dict_from_env() -> dict[str, str]:
 
 
 _TCO_RE = re.compile(r"https?://t\.co/[A-Za-z0-9]+")
+_X_ARTICLE_URL_RE = re.compile(r"https?://(?:www\.)?(?:x|twitter)\.com/i/article/\d+\S*", re.IGNORECASE)
+_SKIP_EXT_HOSTS = (
+    "x.com", "twitter.com", "t.co", "twimg.com",
+    "youtube.com", "youtu.be", "instagram.com", "tiktok.com",
+)
+_SKIP_EXT_SUFFIXES = (".png", ".jpg", ".jpeg", ".gif", ".webp", ".mp4", ".mov", ".pdf", ".zip")
 
 
-def _expand_links(raw_text: str, links) -> str:
-    """展开推文中的 t.co 短链，并剔除残留媒体/引用卡片 t.co 尾巴。"""
+def _expand_links(raw_text: str, links, *, strip_x_article: bool = False) -> str:
+    """展开推文中的 t.co 短链，并剔除残留媒体/引用卡片 t.co 尾巴及同源 X Article 冗余链。"""
     text = (raw_text or "").strip()
     for lk in links or []:
         tco = getattr(lk, "tcourl", "") or ""
@@ -139,15 +149,73 @@ def _expand_links(raw_text: str, links) -> str:
         if tco and dest and tco in text:
             text = text.replace(tco, dest)
     text = _TCO_RE.sub("", text)
+    if strip_x_article:
+        text = _X_ARTICLE_URL_RE.sub("", text)
     text = re.sub(r"[ \t]{2,}", " ", text)
     return "\n".join(ln.rstrip() for ln in text.splitlines()).strip()
 
 
-def _format_tweet_text(t) -> str:
-    """展开 t.co 链接，并补充 X Article 标题/预览与引用推文正文。"""
-    text = _expand_links(getattr(t, "rawContent", ""), getattr(t, "links", None))
+def _extract_external_urls(t) -> list[str]:
+    """提取推文（及引用推文）中的独立外部技术博客/文档/项目链接（排除 x.com 与音视频图床）。"""
+    candidates: list[str] = []
+    link_lists = [getattr(t, "links", None) or []]
+    qt = getattr(t, "quotedTweet", None)
+    if qt is not None:
+        link_lists.append(getattr(qt, "links", None) or [])
 
+    seen: set[str] = set()
+    for lk_list in link_lists:
+        for lk in lk_list:
+            u = (getattr(lk, "url", "") or "").strip()
+            if not u.startswith(("http://", "https://")):
+                continue
+            try:
+                sp = urlsplit(u)
+                host = (sp.hostname or "").lower()
+                path_low = (sp.path or "").lower()
+            except Exception:
+                continue
+            if not host or any(host == h or host.endswith("." + h) for h in _SKIP_EXT_HOSTS):
+                continue
+            if path_low.endswith(_SKIP_EXT_SUFFIXES):
+                continue
+            uk = url_key(u)
+            if uk and uk not in seen:
+                seen.add(uk)
+                candidates.append(u)
+    return candidates
+
+
+def _extract_article_full_text(article) -> str:
+    """从 twscrape Article 对象提取完整正文段落（contentState.blocks），回退 previewText。"""
+    if not article:
+        return ""
+    cs = getattr(article, "contentState", None)
+    blocks = getattr(cs, "blocks", None) if cs else None
+    if blocks:
+        paras = [
+            (getattr(b, "text", "") or "").strip()
+            for b in blocks
+            if (getattr(b, "text", "") or "").strip()
+        ]
+        if paras:
+            return "\n".join(paras)
+    return (
+        getattr(article, "previewText", "")
+        or getattr(article, "summaryText", "")
+        or ""
+    ).strip()
+
+
+def _format_tweet_text(t) -> str:
+    """展开 t.co 链接，并补充 X Article 标题/预览与引用推文正文（不含同源 x.com/i/article 冗余链）。"""
     article = getattr(t, "article", None)
+    text = _expand_links(
+        getattr(t, "rawContent", ""),
+        getattr(t, "links", None),
+        strip_x_article=bool(article),
+    )
+
     if article:
         a_title = (getattr(article, "title", "") or "").strip()
         a_preview = (
@@ -159,9 +227,9 @@ def _format_tweet_text(t) -> str:
         if a_preview and a_preview not in text:
             preview_snip = a_preview.replace("\n", " ")[:240]
             if text:
-                text = f"{header} {text} | 摘要：{preview_snip}".strip()
+                text = f"{header} {text} | 导语：{preview_snip}".strip()
             else:
-                text = f"{header} {preview_snip}".strip()
+                text = f"{header} 导语：{preview_snip}".strip()
         elif a_title:
             text = f"{header} {text}".strip()
 
@@ -172,7 +240,8 @@ def _format_tweet_text(t) -> str:
         q_text = _expand_links(
             getattr(qt, "rawContent", ""),
             getattr(qt, "links", None),
-        ).replace("\n", " ").strip()[:240]
+            strip_x_article=bool(getattr(qt, "article", None)),
+        ).replace("\n", " ").strip()[:280]
         if q_text or q_url:
             text = f"{text}\n[引用 @{q_user} ({q_url})]: {q_text}".strip()
     return text
@@ -210,7 +279,13 @@ async def _ensure_twscrape_account(pool, account_name: str, cookie_map: dict[str
     )
 
 
-async def _fetch_x_list_async(list_id: int, sent_before: set) -> tuple[list, dict]:
+async def _fetch_x_list_async(
+    list_id: int,
+    sent_before: set,
+    *,
+    ledger_x_ids: set | None = None,
+    enrich_details: bool = True,
+) -> tuple[list, dict]:
     """通过 twscrape 的 SearchTimeline (list:<id>) 抓取自建 X List 过去 WINDOW_H 小时推文。"""
     from twscrape import API, AccountsPool
     from twscrape.logger import set_log_level
@@ -266,12 +341,22 @@ async def _fetch_x_list_async(list_id: int, sent_before: set) -> tuple[list, dic
 
         url = t.url or f"https://x.com/{handle}/status/{t.id_str}"
         uk = url_key(url)
-        if uk in sent_before or uk in seen_in_run:
+        if (
+            uk in sent_before
+            or uk in seen_in_run
+            or (ledger_x_ids and str(t.id_str) in ledger_x_ids)
+        ):
             dropped_dup += 1
             continue
         seen_in_run.add(uk)
 
+        article = getattr(t, "article", None)
+        initial_full = _extract_article_full_text(article) if article else ""
+        # SearchTimeline 通常只返回 preview_text（不含 contentState.blocks），需标记以便后续补拉
+        has_blocks = bool(getattr(getattr(article, "contentState", None), "blocks", None)) if article else False
+
         by_author.setdefault(handle, []).append({
+            "id": int(t.id),
             "handle": handle,
             "name": (getattr(user, "displayname", "") or handle).strip(),
             "bio": (getattr(user, "rawDescription", "") or "").replace("\n", " ").strip()[:80],
@@ -282,6 +367,11 @@ async def _fetch_x_list_async(list_id: int, sent_before: set) -> tuple[list, dic
             "retweets": t.retweetCount or 0,
             "replies": t.replyCount or 0,
             "isQuote": bool(t.isQuoteStatus or t.quotedTweet is not None),
+            "has_article": article is not None,
+            "article_title": (getattr(article, "title", "") or "").strip() if article else "",
+            "article_full_text": initial_full[:15000] if has_blocks else "",
+            "ext_urls": _extract_external_urls(t),
+            "ext_excerpts": [],
         })
 
     # 检查账号是否因 401/风控被 twscrape 标记失效
@@ -299,6 +389,53 @@ async def _fetch_x_list_async(list_id: int, sent_before: set) -> tuple[list, dic
             dropped_cap += len(handle_rows) - PER_BUILDER_CAP
 
     rows.sort(key=lambda x: -x["likes"])
+
+    enriched_articles = 0
+    enriched_blogs = 0
+    if enrich_details and rows:
+        # 1) 对含 X Article 的推文补拉 tweet_details 获取完整 contentState.blocks 正文（最高 15000 字符）
+        article_rows = [r for r in rows if r.get("has_article") and not r.get("article_full_text")][:8]
+        for r in article_rows:
+            try:
+                detail_t = await api.tweet_details(r["id"])
+                full_art = _extract_article_full_text(getattr(detail_t, "article", None)) if detail_t else ""
+                if full_art:
+                    r["article_full_text"] = full_art[:15000]
+                    if not r.get("article_title") and getattr(detail_t, "article", None):
+                        r["article_title"] = (getattr(detail_t.article, "title", "") or "").strip()
+                    enriched_articles += 1
+            except Exception as exc:
+                print(f"  [WARN] 拉取 X Article 详情失败 ({r['url']}): {exc}", file=sys.stderr)
+
+        # 2) 对含独立外部技术博客/文档链接的推文并发抓取正文摘要（最高 4000 字符）
+        ext_tasks: list[tuple[dict, str]] = []
+        seen_ext: set[str] = set()
+        for r in rows:
+            for u in r.get("ext_urls") or []:
+                uk = url_key(u)
+                if uk and uk not in seen_ext:
+                    seen_ext.add(uk)
+                    ext_tasks.append((r, u))
+                if len(ext_tasks) >= 15:
+                    break
+            if len(ext_tasks) >= 15:
+                break
+
+        if ext_tasks:
+            with ThreadPoolExecutor(max_workers=5) as ex:
+                fut_map = [
+                    (r, u, ex.submit(fetch_article_text, u, 10, 4000, 180))
+                    for r, u in ext_tasks
+                ]
+                for r, u, fut in fut_map:
+                    try:
+                        txt = (fut.result(timeout=12) or "").strip()
+                        if txt:
+                            r["ext_excerpts"].append((u, txt))
+                            enriched_blogs += 1
+                    except Exception:
+                        pass
+
     stats = {
         "list_id": list_id,
         "scanned": scanned,
@@ -308,6 +445,8 @@ async def _fetch_x_list_async(list_id: int, sent_before: set) -> tuple[list, dic
         "dropped_old": dropped_old,
         "dropped_dup": dropped_dup,
         "dropped_cap": dropped_cap,
+        "enriched_articles": enriched_articles,
+        "enriched_blogs": enriched_blogs,
         "fetched_at": now,
     }
     return rows, stats
@@ -328,7 +467,8 @@ def _format_context(rows: list[dict], stats: dict) -> str:
         f"【推文实际时间区间】{span}",
         f"【本次可用推文】{len(rows)} 条（活跃 {stats['builders']} 位 builder｜"
         f"共扫描 {stats['scanned']} 条，过滤转推 {stats['dropped_rt']}、回复 {stats['dropped_reply']}、"
-        f"超窗 {stats['dropped_old']}、跨天已播 {stats['dropped_dup']}、单人上限 {stats['dropped_cap']}）",
+        f"超窗 {stats['dropped_old']}、已播/前序去重 {stats['dropped_dup']}、单人上限 {stats['dropped_cap']}｜"
+        f"深抓 X 长文 {stats.get('enriched_articles', 0)} 篇、外链正文 {stats.get('enriched_blogs', 0)} 篇）",
         "",
         "推文的 赞/转/回 是 X 上的真实互动量，可以照实写。",
         "",
@@ -342,9 +482,17 @@ def _format_context(rows: list[dict], stats: dict) -> str:
             f"[时间] {when_s}"
             f"　[赞] {x['likes']}　[转] {x['retweets']}　[回] {x['replies']}"
             + ("　[引用推]" if x["isQuote"] else "")
+            + ("　[X长文]" if x.get("has_article") else "")
         )
         lines.append(f"[原推] {x['url']}")
         lines.append(f"[正文] {x['text']}")
+        if x.get("article_full_text"):
+            a_title = x.get("article_title") or "X Article"
+            lines.append(f"[X Article 全文摘录（《{a_title}》，直接归属上面的 [原推] 链接，正文勿另挂 x.com/i/article 链接）]:")
+            lines.append(x["article_full_text"])
+        for ext_u, ext_txt in x.get("ext_excerpts") or []:
+            lines.append(f"[外链技术博客/文档链接] {ext_u}")
+            lines.append(f"[外链正文摘录]:\n{ext_txt}")
         lines.append("")
 
     return "\n".join(lines)
@@ -358,10 +506,21 @@ def gather() -> tuple[str, dict]:
             "未配置 X_LIST_ID：请在 ~/Library/LaunchAgents/com.shirley.ai-builder-bot.plist 中填入 X_LIST_ID"
         )
 
-    sent_before = load_sent_urls(SENT_URLS)
-    rows, stats = asyncio.run(_fetch_x_list_async(list_id, sent_before))
+    ledger = load_daily_ledger(exclude_bot="🛠️ AI Builder")
+    sent_before = load_sent_urls(SENT_URLS) | ledger["urls"]
+    rows, stats = asyncio.run(
+        _fetch_x_list_async(
+            list_id,
+            sent_before,
+            ledger_x_ids=ledger["x_status_ids"],
+            enrich_details=True,
+        )
+    )
     fetched_at = stats["fetched_at"]
     context = _format_context(rows, stats)
+    ledger_block = format_ledger_context(exclude_bot="🛠️ AI Builder")
+    if ledger_block:
+        context = f"{ledger_block}\n\n{context}"
     metrics = {
         "source_mode": "x_list",
         "list_id": list_id,
@@ -372,6 +531,8 @@ def gather() -> tuple[str, dict]:
         "dropped_old": stats["dropped_old"],
         "dropped_dup": stats["dropped_dup"],
         "dropped_cap": stats["dropped_cap"],
+        "enriched_articles": stats.get("enriched_articles", 0),
+        "enriched_blogs": stats.get("enriched_blogs", 0),
         "feed_lag_h": 0.0,
         "feed_generated_at": fetched_at.isoformat(),
     }
@@ -431,7 +592,7 @@ def run_test_list() -> int:
         print(f"ERROR: 代理不可用：{_PROXY}", file=sys.stderr)
         return 2
 
-    rows, stats = asyncio.run(_fetch_x_list_async(list_id, set()))
+    rows, stats = asyncio.run(_fetch_x_list_async(list_id, set(), enrich_details=False))
     print(
         f"✓ X List {list_id} 测试成功：扫描 {stats['scanned']} 条，"
         f"近 {WINDOW_H}h 命中 {stats['builders']} 位 builder 共 {len(rows)} 条可用推文"
@@ -524,6 +685,7 @@ def run_archive_only(draft_path: Path) -> int:
         return 1
 
     record_sent_urls(SENT_URLS, x_links)
+    record_daily_ledger("🛠️ AI Builder", report, hrefs, date_str=doc_date)
     prefix = f"{meta_summary} | " if meta_summary else ""
     status_line = f"{prefix}Notion 单独归档成功 | Notion ✓ {notion_detail}".strip()
     write_log("OK", status_line)
