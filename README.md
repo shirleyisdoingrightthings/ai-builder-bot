@@ -5,13 +5,13 @@ Daily digest of first-hand tweets and engineering blog posts from leading AI res
 ## Workflow
 
 ```text
-Follow-Builders Feed (X + Blogs) + Curated Builder Whitelist + Personal RSS
+Follow-Builders Feed (X + Blogs) + Personal Engineering RSS
   │
   ▼
 1. Fetch & Filter (builder_report.py --mode fetch)
   ├─ Pull daily feed generated at 14:17 CST (covering the past 24 hours)
   ├─ Filter out institutional/VC/tutorial noise accounts (EXCLUDED_HANDLES)
-  ├─ Supplement with 15 whitelisted builders from AINews & 5 personal engineering blogs
+  ├─ Supplement with official engineering blogs (feed-blogs.json) & 5 personal engineering blogs
   └─ Deduplicate against 7-day sent history (sent_urls.json) & apply per-author caps
   │
   ▼

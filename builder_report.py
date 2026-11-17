@@ -47,7 +47,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "shared"))
 from bot_utils import (already_ran_today, load_sent_urls, url_key,
-                       fetch_rss, parse_entry_date, X_POST_RE,
+                       fetch_rss, parse_entry_date,
                        make_logger, make_pending_saver, proxy_ok,
                        emit_fetch_output, send_x_linked_report)
 
@@ -85,26 +85,7 @@ EXCLUDED_HANDLES = {
     "zarazhangrui", "petergyang", "danshipper",
 }
 
-# 渠道 ②：从 AINews (latent.space/feed) 544 个 X 账号池中定向捞取的扩充 Builder 白名单
-EXTRA_BUILDERS = {
-    "noamshazeer": ("Noam Shazeer", "Character.AI 创始人 / Google Gemini 联创，Transformer 作者"),
-    "polynoamial": ("Noam Brown", "OpenAI 多步推理研究科学家"),
-    "drjimfan": ("Jim Fan", "NVIDIA 具身智能 GEAR Lab 负责人"),
-    "ylecun": ("Yann LeCun", "Meta 首席 AI 科学家"),
-    "sholtodouglas": ("Sholto Douglas", "Anthropic 研究员，专注 Scaling 与强化学习"),
-    "trentonbricken": ("Trenton Bricken", "Anthropic 机械可解释性研究员"),
-    "soumithchintala": ("Soumith Chintala", "PyTorch 联创"),
-    "simonw": ("Simon Willison", "Datasette 创始人 / 独立 AI 工具构建者"),
-    "mitchellh": ("Mitchell Hashimoto", "Ghostty / HashiCorp 创始人"),
-    "hamelhusain": ("Hamel Husain", "Parlance Labs 创始人 / AI Evals 专家"),
-    "eugeneyan": ("Eugene Yan", "Amazon 资深应用科学家"),
-    "clementdelangue": ("Clément Delangue", "Hugging Face CEO"),
-    "hwchase17": ("Harrison Chase", "LangChain 创始人"),
-    "jerryjliu0": ("Jerry Liu", "LlamaIndex 创始人"),
-    "aravindsrinivas": ("Aravind Srinivas", "Perplexity CEO"),
-}
-
-# 渠道 ③：一线 AI Builder 个人技术博客直连 RSS（48h 窗口）
+# 个人技术博客直连 RSS（48h 窗口）
 BUILDER_BLOG_FEEDS = [
     ("Simon Willison (@simonw)", "https://simonwillison.net/atom/everything/", 4),
     ("Lilian Weng (@lilianweng)", "https://lilianweng.github.io/index.xml", 2),
@@ -142,7 +123,6 @@ def _iso(s: str):
 
 
 _TAG_RE = re.compile(r"(?s)<[^>]+>")
-_ANCHOR_RE = re.compile(r'(?is)<a\b[^>]*href=["\']([^"\']*)["\'][^>]*>(.*?)</a>')
 
 
 def _plain_text(fragment: str, limit: int = 0) -> str:
@@ -155,121 +135,13 @@ def _plain_text(fragment: str, limit: int = 0) -> str:
     return text[:limit] if limit else text
 
 
-def _fetch_extra_builder_tweets(sent_before: set, existing_urls: set) -> list:
-    """渠道 ②：从 latent.space/feed 的 [AINews] 期刊中提取 EXTRA_BUILDERS 白名单原推及上下文。"""
-    extra_rows = []
-    try:
-        entries = fetch_rss("https://www.latent.space/feed", limit=10)
-        entries = [e for e in entries
-                   if "[ainews]" in (getattr(e, "title", "") or "").lower()]
-        cutoff = datetime.now(timezone.utc) - timedelta(hours=48)
-        for e in entries[:2]:
-            dt = parse_entry_date(e)
-            if dt and dt < cutoff:
-                continue
-            body = ""
-            for item in (getattr(e, "content", None) or []):
-                val = item.get("value") if isinstance(item, dict) else getattr(item, "value", "")
-                if val and len(val) > 2000:
-                    body = val
-                    break
-            if not body:
-                body = getattr(e, "summary", "") or ""
-            if not body:
-                continue
-
-            # 定位白名单原推并截取周围上下文
-            hits = {}
-            order = []
-            for m in X_POST_RE.finditer(body):
-                h_raw, pid = m.group(1), m.group(2)
-                h_low = h_raw.lower()
-                if h_low not in EXTRA_BUILDERS:
-                    continue
-                url = f"https://x.com/{h_raw}/status/{pid}"
-                uk = url_key(url)
-                if uk in sent_before or uk in existing_urls:
-                    continue
-                if pid not in hits:
-                    hits[pid] = {
-                        "handle": h_raw,
-                        "url": url,
-                        "idx": len(order),
-                        "createdAt": dt.isoformat() if dt else "",
-                    }
-                    order.append(pid)
-
-            if not hits:
-                continue
-
-            ref_links = []
-
-            def _mark_anchor(m):
-                href, inner = (m.group(1) or "").strip(), m.group(2) or ""
-                hit = X_POST_RE.search(href)
-                if hit and hit.group(2) in hits:
-                    return f"{inner} ⟦EB{hits[hit.group(2)]['idx']}⟧ "
-                label = _plain_text(inner)
-                if label and href.startswith(("http://", "https://")):
-                    low = href.lower().split("?", 1)[0]
-                    if not (any(h in low for h in ("substackcdn.com", "pbs.twimg.com")) and low.endswith((".png", ".jpg", ".jpeg", ".gif", ".webp"))):
-                        clean_href = f"https://x.com/{hit.group(1)}/status/{hit.group(2)}" if hit else href
-                        idx = len(ref_links)
-                        ref_links.append((label, clean_href))
-                        return f"{inner} ⟦EL{idx}⟧ "
-                return inner
-
-            marked = _ANCHOR_RE.sub(_mark_anchor, body)
-            plain = _plain_text(marked)
-            for pid in order:
-                info = hits[pid]
-                token = f"⟦EB{info['idx']}⟧"
-                pos = plain.find(token)
-                if pos >= 0:
-                    left = max(0, pos - 200)
-                    raw_snip = plain[left:pos] + plain[pos + len(token):pos + len(token) + 80]
-                    seen_r, refs = {url_key(info["url"])}, []
-                    for rm in re.finditer(r"⟦EL(\d+)⟧", raw_snip):
-                        rlbl, rurl = ref_links[int(rm.group(1))]
-                        ruk = url_key(rurl)
-                        if ruk not in seen_r:
-                            seen_r.add(ruk)
-                            refs.append((rlbl, rurl))
-                    snippet = re.sub(r"⟦E[BL]\d+⟧", "", raw_snip)
-                    snippet = re.sub(r"^[^⟦]{0,12}⟧", "", snippet)
-                    snippet = re.sub(r"⟦[^⟧]*$", "", snippet).strip()
-                else:
-                    snippet, refs = "", []
-                if len(snippet) < 25:
-                    continue
-                name, bio = EXTRA_BUILDERS[info["handle"].lower()]
-                existing_urls.add(url_key(info["url"]))
-                extra_rows.append({
-                    "handle": info["handle"],
-                    "name": name,
-                    "bio": bio,
-                    "url": info["url"],
-                    "ref_links": refs,
-                    "text": f"[AINews 摘录上下文] {snippet}",
-                    "createdAt": info["createdAt"],
-                    "likes": 0,
-                    "retweets": 0,
-                    "replies": 0,
-                    "isQuote": False,
-                    "from_ainews": True,
-                })
-    except Exception as exc:
-        print(f"[WARN] EXTRA_BUILDERS 渠道抓取异常（不阻断主流程）: {exc}", file=sys.stderr)
-    return extra_rows
-
-
 def _fetch_builder_blogs(sent_before: set) -> list:
-    """渠道 ①（follow-builders feed-blogs.json）+ 渠道 ③（Builder 个人博客直连 RSS，48h 窗口）。"""
+    """follow-builders feed-blogs.json + Builder 个人博客直连 RSS（48h 窗口）。"""
     blog_items = []
     seen = set()
     cutoff = datetime.now(timezone.utc) - timedelta(hours=48)
 
-    # 渠道 ①：follow-builders 的 feed-blogs.json
+    # 1. follow-builders 官方工程博客（feed-blogs.json）
     try:
         r = _SESSION.get(FEED_BLOGS_URL, timeout=15)
         if r.status_code == 200:
@@ -297,7 +169,7 @@ def _fetch_builder_blogs(sent_before: set) -> list:
     except Exception as exc:
         print(f"[WARN] feed-blogs.json 抓取异常: {exc}", file=sys.stderr)
 
-    # 渠道 ③：Builder 个人博客直连 RSS
+    # 2. Builder 个人博客直连 RSS
     for author_label, feed_url, limit in BUILDER_BLOG_FEEDS:
         try:
             entries = fetch_rss(feed_url, limit=limit)
@@ -330,7 +202,7 @@ def _fetch_builder_blogs(sent_before: set) -> list:
 # ===== 取材 =====
 
 def gather() -> tuple:
-    """拉 feed → 剔除非个人噪音号 → 补充三路扩充源 → 跨天去重 → 按互动量排序，返回 (context, metrics, lag_h)。"""
+    """拉 feed → 剔除非个人噪音号 → 补充工程与个人技术博客 → 跨天去重 → 按互动量排序，返回 (context, metrics, lag_h)。"""
     r = _SESSION.get(FEED_URL, timeout=30)
     r.raise_for_status()
     feed = r.json()
@@ -377,17 +249,12 @@ def gather() -> tuple:
                 "retweets": t.get("retweets", 0) or 0,
                 "replies": t.get("replies", 0) or 0,
                 "isQuote": bool(t.get("isQuote")),
-                "from_ainews": False,
             })
 
     # 全局按点赞排序：让写稿方先看到讨论最热的，好定详略
     rows.sort(key=lambda x: -x["likes"])
 
-    # 渠道 ②：补充 EXTRA_BUILDERS 原推
-    extra_rows = _fetch_extra_builder_tweets(sent_before, existing_urls)
-    rows.extend(extra_rows)
-
-    # 渠道 ① + ③：补充官方 Engineering 博客与个人技术博客（48h 内新文）
+    # 补充官方 Engineering 博客与个人技术博客（48h 内新文）
     blog_rows = _fetch_builder_blogs(sent_before)
 
     times = [_iso(x["createdAt"]) for x in rows]
@@ -400,26 +267,20 @@ def gather() -> tuple:
         f"（距现在 {lag_h} 小时，上游回看窗口 {lookback}h）",
         f"【推文实际时间区间】{span}",
         f"【本次可用推文】{len(rows)} 条（主源 {kept_builders} 位 builder，已剔除 {dropped_excluded} 个机构/VC/教程号；"
-        f"扩充渠道额外命中 {len(extra_rows)} 条原推 + {len(blog_rows)} 篇博客；"
+        f"博客命中 {len(blog_rows)} 篇；"
         f"跨天已播过滤掉 {dropped_dup} 条，单人上限滤掉 {dropped_cap} 条）",
         "",
-        "⚠️ 主源推文的 赞/转/回 是 X 上的真实互动量，可以照实写；来自 [AINews 摘录上下文] 的扩充推文未附互动量数字，不要编造赞数。",
+        "主源推文的 赞/转/回 是 X 上的真实互动量，可以照实写。",
         "",
     ]
     for i, x in enumerate(rows, 1):
         when = _iso(x["createdAt"])
         when_s = when.strftime("%m-%d %H:%M UTC") if when else x["createdAt"]
         lines.append(f"--- {i}. @{x['handle']}（{x['name']}｜{x['bio']}）")
-        if x.get("from_ainews"):
-            lines.append(f"[时间] {when_s}　[来源] AINews 扩充白名单（无互动量统计）")
-        else:
-            lines.append(f"[时间] {when_s}"
-                         f"　[赞] {x['likes']}　[转] {x['retweets']}　[回] {x['replies']}"
-                         + ("　[引用推]" if x["isQuote"] else ""))
+        lines.append(f"[时间] {when_s}"
+                     f"　[赞] {x['likes']}　[转] {x['retweets']}　[回] {x['replies']}"
+                     + ("　[引用推]" if x["isQuote"] else ""))
         lines.append(f"[原推] {x['url']}")
-        if x.get("ref_links"):
-            ref_s = " | ".join(f"{lbl} -> {u}" for lbl, u in x["ref_links"])
-            lines.append(f"[引用链接] {ref_s}")
         lines.append(f"[正文] {x['text']}")
         lines.append("")
 
@@ -439,7 +300,6 @@ def gather() -> tuple:
     metrics = {
         "tweets": len(rows),
         "builders": kept_builders,
-        "extra_tweets": len(extra_rows),
         "blogs": len(blog_rows),
         "dropped_excluded": dropped_excluded,
         "dropped_dup": dropped_dup,
