@@ -1,0 +1,51 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<!--
+    配置模板：复制为 ~/Library/LaunchAgents/com.shirley.ai-builder-bot.plist 并填入真实值。
+    claude_report.sh 通过 PlistBuddy 从 EnvironmentVariables 读取密钥与代理端口（统一为 1082）。
+-->
+<dict>
+    <key>Label</key>
+    <string>com.shirley.ai-builder-bot</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/bin/true</string>
+    </array>
+
+    <key>RunAtLoad</key>
+    <false/>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <!-- 飞书自定义机器人 webhook -->
+        <key>FEISHU_WEBHOOK</key>
+        <string>YOUR_FEISHU_WEBHOOK_URL</string>
+
+        <!-- 本地代理（统一 1082）：访问 X GraphQL 接口必需，推送飞书为直连 -->
+        <key>HTTPS_PROXY</key>
+        <string>http://127.0.0.1:1082</string>
+        <key>HTTP_PROXY</key>
+        <string>http://127.0.0.1:1082</string>
+
+        <!-- 自建 X List ID 或完整 URL（如 https://x.com/i/lists/1234567890） -->
+        <key>X_LIST_ID</key>
+        <string>YOUR_X_LIST_ID</string>
+
+        <!-- X 小号浏览器登录 Cookie（从 DevTools -> Application -> Cookies -> https://x.com 获取） -->
+        <key>X_AUTH_TOKEN</key>
+        <string>YOUR_X_AUTH_TOKEN</string>
+        <key>X_CT0</key>
+        <string>YOUR_X_CT0</string>
+
+        <!-- 可选：小号标签名（默认 builder_alt）、回看窗口小时数（默认 24）、是否保留回复（默认 0） -->
+        <key>X_ACCOUNT_NAME</key>
+        <string>builder_alt</string>
+        <key>BUILDER_WINDOW_H</key>
+        <string>24</string>
+        <key>BUILDER_INCLUDE_REPLIES</key>
+        <string>0</string>
+    </dict>
+</dict>
+</plist>
