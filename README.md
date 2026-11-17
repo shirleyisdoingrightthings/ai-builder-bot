@@ -1,16 +1,16 @@
 # AI Builder Bot
 
-Daily digest of first-hand tweets from curated AI researchers, founders, and engineers, delivered to Feishu and archived to Notion.
+Daily digest of first-hand tweets from a curated X List of AI researchers, founders, and engineers, delivered to Feishu and archived to Notion.
 
 ## Workflow
 
 ```text
-Private/Public X List (via twscrape + cookie auth)
-  │   (temporary fallback: follow-builders JSON + personal RSS if X_LIST_ID is unset)
+Curated X List (via twscrape SearchTimeline `list:<id>` + cookie auth)
+  │
   ▼
 1. Fetch & Filter (claude_report.sh fetch -> .venv Python 3.12)
-  ├─ Pull ListLatestTweetsTimeline for the past 24h via twscrape + proxy (1082)
-  ├─ Filter out pure retweets & non-self replies, expand t.co links, attach quote context
+  ├─ Pull past 24h non-retweet / non-reply posts from X_LIST_ID via twscrape
+  ├─ Expand t.co links, attach X Article titles & quoted tweet context
   └─ Deduplicate against 7-day sent history (sent_urls.json) & apply per-author caps
   │
   ▼
@@ -26,9 +26,9 @@ Private/Public X List (via twscrape + cookie auth)
   └─ Push to Feishu webhook, archive to Notion, and store sent tweet URLs
 ```
 
-## Setup (Route B: Zero-Cost X List via `twscrape`)
+## Setup (Zero-Cost X List via `twscrape`)
 
-1. Create an X List (private or public) containing your curated AI builders and grab its `X_LIST_ID` (from `https://x.com/i/lists/<id>`).
+1. Create an X List containing your curated AI builders and grab its `X_LIST_ID` (from `https://x.com/i/lists/<id>`).
 2. Log into an X alt account in a browser and copy `auth_token` and `ct0` cookies from DevTools (`Application -> Cookies -> https://x.com`).
 3. Copy `com.shirley.ai-builder-bot.plist.example` to `~/Library/LaunchAgents/com.shirley.ai-builder-bot.plist` and fill in `FEISHU_WEBHOOK`, `X_LIST_ID`, `X_AUTH_TOKEN`, and `X_CT0`.
 4. Verify connectivity (read-only):

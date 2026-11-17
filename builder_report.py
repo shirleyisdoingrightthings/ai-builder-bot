@@ -2,13 +2,12 @@
 """
 AI Builder 日报
 
-每天把 X 上一线 AI builder（研究员 / 创始人 / 产品 / 工程）本人发的推文整理成一份
+每天把自建 X List 中一线 AI builder（研究员 / 创始人 / 产品 / 工程）本人发的推文整理成一份
 播报，**每条话题都带原推直链**，由 AI 定时任务写稿后推送到飞书并归档至 Notion。本脚本只负责取材与推送，
 不含写稿用的第三方大模型 API。
 
-两种运行模式（--mode，均零 API 成本）：
-- fetch    ：优先通过 twscrape 直连抓取自建 X List（配置 X_LIST_ID 后彻底脱离上游定时依赖）；
-             未配置 X_LIST_ID 时临时回退 follow-builders 公共 feed。落盘 logs/last_context.txt
+三种运行模式（--mode，均零 API 成本）：
+- fetch    ：通过 twscrape 拉取自建 X List 过去 24h 原创与引用推文 → 落盘 logs/last_context.txt
 - send     ：读取写好的稿子文件 → 清洗 HTML → 推送飞书 + 同步 Notion + 写日志
 - test-list：只读测试 X List 与 Cookie 连通性，不写 run.log 或 last_context.txt
 
@@ -17,7 +16,6 @@ AI Builder 日报
 
 import argparse
 import asyncio
-import html
 import json
 import os
 import plistlib
@@ -28,11 +26,8 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "shared"))
 from bot_utils import (already_ran_today, load_sent_urls, url_key,
-                       fetch_rss, parse_entry_date,
                        make_logger, make_pending_saver, proxy_ok,
                        emit_fetch_output, send_x_linked_report)
-
-import requests
 
 BASE = Path(__file__).parent
 LOG_FILE = BASE / "logs" / "run.log"
@@ -46,33 +41,11 @@ SENT_URLS = BASE / "logs" / "sent_urls.json"
 TWSCRAPE_DB = BASE / "logs" / "twscrape_accounts.db"
 PLIST_PATH = Path.home() / "Library" / "LaunchAgents" / "com.shirley.ai-builder-bot.plist"
 
-FEED_URL = os.getenv(
-    "BUILDER_FEED_URL",
-    "https://raw.githubusercontent.com/zarazhangrui/follow-builders/main/feed-x.json")
-FEED_BLOGS_URL = os.getenv(
-    "BUILDER_BLOGS_URL",
-    "https://raw.githubusercontent.com/zarazhangrui/follow-builders/main/feed-blogs.json")
-FEED_STALE_H = int(os.getenv("BUILDER_FEED_STALE_H", "36"))
+# 每位 builder 最多进多少条，避免高频账号刷屏挤掉其他人
 PER_BUILDER_CAP = int(os.getenv("BUILDER_PER_ACCOUNT_CAP", "4"))
 WINDOW_H = int(os.getenv("BUILDER_WINDOW_H", "24"))
 LIST_SCAN_LIMIT = int(os.getenv("BUILDER_LIST_SCAN_LIMIT", "200"))
 INCLUDE_REPLIES = os.getenv("BUILDER_INCLUDE_REPLIES", "0") == "1"
-
-# 回退 follow-builders 时剔除的 8 个非一线个人账号
-EXCLUDED_HANDLES = {
-    "claudeai", "googlelabs",
-    "mattturck", "adityaag", "nikunj",
-    "zarazhangrui", "petergyang", "danshipper",
-}
-
-# 回退 follow-builders 时附带的个人技术博客直连 RSS（48h 窗口）
-BUILDER_BLOG_FEEDS = [
-    ("Simon Willison (@simonw)", "https://simonwillison.net/atom/everything/", 4),
-    ("Lilian Weng (@lilianweng)", "https://lilianweng.github.io/index.xml", 2),
-    ("Hamel Husain (@HamelHusain)", "https://hamel.dev/index.xml", 2),
-    ("Armin Ronacher (@mitsuhiko)", "https://lucumr.pocoo.org/feed.atom", 2),
-    ("Eugene Yan (@eugeneyan)", "https://eugeneyan.com/rss/", 2),
-]
 
 FEISHU_WEBHOOK = os.getenv("FEISHU_WEBHOOK", "")
 
@@ -80,14 +53,11 @@ write_log = make_logger(LOG_FILE, JSONL_FILE)
 save_pending = make_pending_saver(CACHE_FILE)
 _PROXY = os.getenv("HTTPS_PROXY") or os.getenv("HTTP_PROXY")
 
-_SESSION = requests.Session()
-_TAG_RE = re.compile(r"(?s)<[^>]+>")
-
 
 def _proxy_ok() -> bool:
-    """代理预检 + 端口自愈，实现见 shared/bot_utils.proxy_ok。"""
+    """代理预检 + 端口/TUN 自愈，实现见 shared/bot_utils.proxy_ok。"""
     global _PROXY
-    ok, _PROXY = proxy_ok(_PROXY, _SESSION)
+    ok, _PROXY = proxy_ok(_PROXY, None)
     if ok and _PROXY:
         os.environ["HTTP_PROXY"] = _PROXY
         os.environ["HTTPS_PROXY"] = _PROXY
@@ -121,16 +91,6 @@ def _iso(s: str):
         return datetime.fromisoformat(s.replace("Z", "+00:00"))
     except Exception:
         return None
-
-
-def _plain_text(fragment: str, limit: int = 0) -> str:
-    text = re.sub(r"(?i)<br\s*/?>", "\n", fragment or "")
-    text = re.sub(r"(?i)</(p|li|div|h[1-6])>", "\n", text)
-    text = _TAG_RE.sub("", text)
-    text = html.unescape(text)
-    text = re.sub(r"[ \t]+", " ", text)
-    text = re.sub(r"\n{3,}", "\n\n", text).strip()
-    return text[:limit] if limit else text
 
 
 def _parse_list_id(raw: str) -> int | None:
@@ -218,7 +178,7 @@ async def _ensure_twscrape_account(pool, account_name: str, cookie_map: dict[str
 
 
 async def _fetch_x_list_async(list_id: int, sent_before: set) -> tuple[list, dict]:
-    """通过 twscrape 抓取自建 X List 过去 WINDOW_H 小时内的推文。"""
+    """通过 twscrape 的 SearchTimeline (list:<id>) 抓取自建 X List 过去 WINDOW_H 小时推文。"""
     from twscrape import API, AccountsPool
 
     account_name = (os.getenv("X_ACCOUNT_NAME") or "builder_alt").strip() or "builder_alt"
@@ -237,7 +197,8 @@ async def _fetch_x_list_async(list_id: int, sent_before: set) -> tuple[list, dic
     old_streak = 0
     scanned = 0
 
-    async for t in api.list_timeline(list_id, limit=LIST_SCAN_LIMIT):
+    query = f"list:{list_id} -filter:retweets" + ("" if INCLUDE_REPLIES else " -filter:replies")
+    async for t in api.search(query, limit=LIST_SCAN_LIMIT):
         scanned += 1
         t_date = t.date if t.date.tzinfo else t.date.replace(tzinfo=timezone.utc)
         if t_date < cutoff:
@@ -257,7 +218,6 @@ async def _fetch_x_list_async(list_id: int, sent_before: set) -> tuple[list, dic
         if not handle:
             continue
 
-        # 默认跳过对他人推文的零散回复，保留主动发推与本人自串（self-thread）
         if not INCLUDE_REPLIES and t.inReplyToTweetId is not None:
             reply_user = (
                 getattr(getattr(t, "inReplyToUser", None), "username", None)
@@ -317,12 +277,8 @@ async def _fetch_x_list_async(list_id: int, sent_before: set) -> tuple[list, dic
     return rows, stats
 
 
-def _format_context(
-    rows: list[dict],
-    header_lines: list[str],
-    blog_rows: list[dict] | None = None,
-) -> str:
-    """统一格式化输出给写稿模型的素材上下文。"""
+def _format_context(rows: list[dict], stats: dict) -> str:
+    """格式化输出给写稿模型的 X List 素材上下文。"""
     times = [_iso(x["createdAt"]) for x in rows]
     times = [t for t in times if t]
     span = (
@@ -330,9 +286,13 @@ def _format_context(
         f"{max(times).strftime('%Y-%m-%d %H:%M')} UTC"
     ) if times else "无"
 
-    lines = list(header_lines)
-    lines.insert(1, f"【推文实际时间区间】{span}")
-    lines += [
+    fetched_at = stats["fetched_at"]
+    lines = [
+        f"【抓取模式】X List 直连（List ID: {stats['list_id']}，回看窗口 {WINDOW_H}h，抓取时间 {fetched_at.strftime('%Y-%m-%d %H:%M')} UTC）",
+        f"【推文实际时间区间】{span}",
+        f"【本次可用推文】{len(rows)} 条（活跃 {stats['builders']} 位 builder｜"
+        f"共扫描 {stats['scanned']} 条，过滤转推 {stats['dropped_rt']}、回复 {stats['dropped_reply']}、"
+        f"超窗 {stats['dropped_old']}、跨天已播 {stats['dropped_dup']}、单人上限 {stats['dropped_cap']}）",
         "",
         "推文的 赞/转/回 是 X 上的真实互动量，可以照实写。",
         "",
@@ -351,180 +311,26 @@ def _format_context(
         lines.append(f"[正文] {x['text']}")
         lines.append("")
 
-    if blog_rows:
-        lines.append("=== BUILDER_BLOGS_BEGIN ===")
-        lines.append(f"【Builder 深度长文 / 官方工程博客（48h 内新发，共 {len(blog_rows)} 篇）】")
-        lines.append("（注：长文可作为独立条目或补充印证写进日报，引用时附上对应链接；全篇仍须保证至少带一条 x.com 原推直链）")
-        lines.append("")
-        for j, b in enumerate(blog_rows, 1):
-            lines.append(f"--- [Blog {j}] {b['author']}：《{b['title']}》")
-            lines.append(f"[时间] {b['date']}　[链接] {b['url']}")
-            if b["summary"]:
-                lines.append(f"[摘要] {b['summary']}")
-            lines.append("")
-        lines.append("=== BUILDER_BLOGS_END ===")
-
     return "\n".join(lines)
 
 
-def _fetch_builder_blogs(sent_before: set) -> list:
-    """回退模式专用：follow-builders feed-blogs.json + Builder 个人博客直连 RSS（48h 窗口）。"""
-    blog_items = []
-    seen = set()
-    cutoff = datetime.now(timezone.utc) - timedelta(hours=48)
-
-    try:
-        r = _SESSION.get(FEED_BLOGS_URL, timeout=15)
-        if r.status_code == 200:
-            data = r.json()
-            for item in data.get("blogs", []):
-                if not isinstance(item, dict):
-                    continue
-                url = item.get("url") or item.get("link") or ""
-                title = (item.get("title") or "").strip()
-                if not url or not title:
-                    continue
-                uk = url_key(url)
-                if uk in sent_before or uk in seen:
-                    continue
-                seen.add(uk)
-                src = item.get("source") or item.get("author") or "Official AI Blog"
-                summary = _plain_text(item.get("summary") or item.get("description") or item.get("content") or "", 320)
-                blog_items.append({
-                    "author": src,
-                    "title": title,
-                    "url": url,
-                    "date": (item.get("publishedAt") or item.get("date") or "")[:16],
-                    "summary": summary,
-                })
-    except Exception as exc:
-        print(f"[WARN] feed-blogs.json 抓取异常: {exc}", file=sys.stderr)
-
-    for author_label, feed_url, limit in BUILDER_BLOG_FEEDS:
-        try:
-            entries = fetch_rss(feed_url, limit=limit)
-            for e in entries:
-                dt = parse_entry_date(e)
-                if dt and dt < cutoff:
-                    continue
-                url = getattr(e, "link", "") or getattr(e, "id", "")
-                title = (getattr(e, "title", "") or "").strip()
-                if not url or not title:
-                    continue
-                uk = url_key(url)
-                if uk in sent_before or uk in seen:
-                    continue
-                seen.add(uk)
-                summary = _plain_text(getattr(e, "summary", "") or "", 320)
-                blog_items.append({
-                    "author": author_label,
-                    "title": title,
-                    "url": url,
-                    "date": dt.strftime("%Y-%m-%d %H:%M UTC") if dt else "",
-                    "summary": summary,
-                })
-        except Exception as exc:
-            print(f"[WARN] Builder 博客 {feed_url} 抓取异常: {exc}", file=sys.stderr)
-
-    return blog_items
-
-
-def _gather_follow_builders_fallback(sent_before: set) -> tuple[str, dict, float]:
-    """未配置 X_LIST_ID 时的临时回退通道（follow-builders + 个人博客 RSS）。"""
-    r = _SESSION.get(FEED_URL, timeout=30)
-    r.raise_for_status()
-    feed = r.json()
-
-    generated = _iso(feed.get("generatedAt", "")) or datetime.now(timezone.utc)
-    lag_h = round((datetime.now(timezone.utc) - generated).total_seconds() / 3600, 1)
-    lookback = feed.get("lookbackHours", 24)
-
-    rows, dropped_dup, dropped_cap, dropped_excluded = [], 0, 0, 0
-    existing_urls = set()
-    kept_builders = 0
-
-    for acct in feed.get("x", []):
-        handle = acct.get("handle", "")
-        if handle.lower().lstrip("@") in EXCLUDED_HANDLES:
-            dropped_excluded += 1
-            continue
-        kept_builders += 1
-        name = acct.get("name", "")
-        bio = (acct.get("bio", "") or "")[:80]
-        kept_this = 0
-        tweets = sorted(acct.get("tweets", []),
-                        key=lambda t: -(t.get("likes", 0) or 0))
-        for t in tweets:
-            url = t.get("url", "")
-            if not url:
-                continue
-            uk = url_key(url)
-            if uk in sent_before or uk in existing_urls:
-                dropped_dup += 1
-                continue
-            if kept_this >= PER_BUILDER_CAP:
-                dropped_cap += 1
-                continue
-            kept_this += 1
-            existing_urls.add(uk)
-            rows.append({
-                "handle": handle, "name": name, "bio": bio, "url": url,
-                "text": (t.get("text", "") or "").strip(),
-                "createdAt": t.get("createdAt", ""),
-                "likes": t.get("likes", 0) or 0,
-                "retweets": t.get("retweets", 0) or 0,
-                "replies": t.get("replies", 0) or 0,
-                "isQuote": bool(t.get("isQuote")),
-            })
-
-    rows.sort(key=lambda x: -x["likes"])
-    blog_rows = _fetch_builder_blogs(sent_before)
-
-    header = [
-        f"【feed 生成时间】{generated.strftime('%Y-%m-%d %H:%M')} UTC"
-        f"（距现在 {lag_h} 小时，上游回看窗口 {lookback}h｜未配置 X_LIST_ID，临时回退 follow-builders）",
-        f"【本次可用推文】{len(rows)} 条（主源 {kept_builders} 位 builder，已剔除 {dropped_excluded} 个机构/VC/教程号；"
-        f"博客命中 {len(blog_rows)} 篇；"
-        f"跨天已播过滤掉 {dropped_dup} 条，单人上限滤掉 {dropped_cap} 条）",
-    ]
-    context = _format_context(rows, header, blog_rows)
-    metrics = {
-        "source_mode": "follow_builders_fallback",
-        "tweets": len(rows),
-        "builders": kept_builders,
-        "blogs": len(blog_rows),
-        "dropped_excluded": dropped_excluded,
-        "dropped_dup": dropped_dup,
-        "dropped_cap": dropped_cap,
-        "feed_lag_h": lag_h,
-        "feed_generated_at": generated.isoformat(),
-    }
-    return context, metrics, lag_h
-
-
-def gather() -> tuple[str, dict, float]:
-    """取材主入口：配置了 X_LIST_ID 时独占使用 twscrape X List；否则回退 follow-builders。"""
-    sent_before = load_sent_urls(SENT_URLS)
+def gather() -> tuple[str, dict]:
+    """拉取自建 X List 过去 WINDOW_H 小时推文，返回 (context, metrics)。"""
     list_id = _parse_list_id(os.getenv("X_LIST_ID", ""))
     if list_id is None:
-        print("[INFO] 未检测到 X_LIST_ID，临时使用 follow-builders 回退源", file=sys.stderr)
-        return _gather_follow_builders_fallback(sent_before)
+        raise RuntimeError(
+            "未配置 X_LIST_ID：请在 ~/Library/LaunchAgents/com.shirley.ai-builder-bot.plist 中填入 X_LIST_ID"
+        )
 
+    sent_before = load_sent_urls(SENT_URLS)
     rows, stats = asyncio.run(_fetch_x_list_async(list_id, sent_before))
     fetched_at = stats["fetched_at"]
-    header = [
-        f"【抓取模式】X List 直连（List ID: {list_id}，回看窗口 {WINDOW_H}h，抓取时间 {fetched_at.strftime('%Y-%m-%d %H:%M')} UTC）",
-        f"【本次可用推文】{len(rows)} 条（活跃 {stats['builders']} 位 builder｜"
-        f"共扫描 {stats['scanned']} 条，过滤转推 {stats['dropped_rt']}、回复 {stats['dropped_reply']}、"
-        f"超窗 {stats['dropped_old']}、跨天已播 {stats['dropped_dup']}、单人上限 {stats['dropped_cap']}）",
-    ]
-    context = _format_context(rows, header, blog_rows=None)
+    context = _format_context(rows, stats)
     metrics = {
         "source_mode": "x_list",
         "list_id": list_id,
         "tweets": len(rows),
         "builders": stats["builders"],
-        "blogs": 0,
         "dropped_rt": stats["dropped_rt"],
         "dropped_reply": stats["dropped_reply"],
         "dropped_old": stats["dropped_old"],
@@ -533,7 +339,7 @@ def gather() -> tuple[str, dict, float]:
         "feed_lag_h": 0.0,
         "feed_generated_at": fetched_at.isoformat(),
     }
-    return context, metrics, 0.0
+    return context, metrics
 
 
 # ===== 模式 1：fetch =====
@@ -548,39 +354,30 @@ def run_fetch() -> int:
         return 0
 
     try:
-        context, metrics, lag_h = gather()
+        context, metrics = gather()
     except Exception as e:
         print("=== FEED_ERROR ===")
-        print(f"拉取素材失败：{e}")
-        write_log("WARN", f"builder 素材拉取失败，未发送：{e}")
+        print(f"拉取 X List 失败：{e}")
+        write_log("WARN", f"X List 拉取失败，未发送：{e}")
         return 0
 
     if metrics["tweets"] == 0:
         print("=== NO_TWEETS ===")
-        extra_blog_note = (
-            f"（另有 {metrics.get('blogs', 0)} 篇博客新文，但缺少 x.com 原推直链，按出稿硬门禁未发送）"
-            if metrics.get("blogs", 0) > 0
-            else "（窗口内暂无符合条件的新推文）"
-        )
-        write_log("WARN", f"没有可用的新推文{extra_blog_note}，未发送")
+        write_log("WARN", "X List 窗口内没有可用的新推文，未发送")
         return 0
 
-    is_x_list = metrics.get("source_mode") == "x_list"
-    lag_note = f"X List 直连" if is_x_list else f"feed 滞后 {lag_h}h"
     FETCH_META.write_text(json.dumps(
-        {"log_summary": f"builder {metrics['builders']} 位 / 推文 {metrics['tweets']} 条（{lag_note}）",
+        {"log_summary": f"builder {metrics['builders']} 位 / 推文 {metrics['tweets']} 条（X List 直连）",
          "fetch_date": datetime.now().strftime("%Y-%m-%d"),
          "metrics": metrics}, ensure_ascii=False), encoding="utf-8")
 
-    out = ["=== FETCH_OK ===",
-           f"今天日期：{datetime.now().strftime('%Y-%m-%d')}"]
-    if not is_x_list and lag_h > FEED_STALE_H:
-        out += ["=== FEED_STALE ===",
-                f"上游 feed 已滞后 {lag_h} 小时（阈值 {FEED_STALE_H}h），"
-                f"多半是 follow-builders 的 GitHub Actions 断了。"
-                f"照常出稿，但务必在稿子里写明这批推文的实际日期。",
-                "=== FEED_STALE_END ==="]
-    out += ["=== CONTEXT_BEGIN ===", context, "=== CONTEXT_END ==="]
+    out = [
+        "=== FETCH_OK ===",
+        f"今天日期：{datetime.now().strftime('%Y-%m-%d')}",
+        "=== CONTEXT_BEGIN ===",
+        context,
+        "=== CONTEXT_END ===",
+    ]
     emit_fetch_output(out, LAST_CONTEXT)
     return 0
 
