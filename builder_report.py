@@ -6,10 +6,11 @@ AI Builder 日报
 播报，**每条话题都带原推直链**，由 AI 定时任务写稿后推送到飞书并归档至 Notion。本脚本只负责取材与推送，
 不含写稿用的第三方大模型 API。
 
-三种运行模式（--mode，均零 API 成本）：
-- fetch    ：通过 twscrape 拉取自建 X List 过去 24h 原创与引用推文 → 落盘 logs/last_context.txt
-- send     ：读取写好的稿子文件 → 清洗 HTML → 推送飞书 + 同步 Notion + 写日志
-- test-list：只读测试 X List 与 Cookie 连通性，不写 run.log 或 last_context.txt
+四种运行模式（--mode，均零 API 成本）：
+- fetch       ：通过 twscrape 拉取自建 X List 过去 24h 原创与引用推文 → 落盘 logs/last_context.txt
+- send        ：读取写好的稿子文件 → 清洗 HTML → 推送飞书 + 同步 Notion + 写日志
+- archive-only：读取写好的稿子文件 → 清洗 HTML → 仅归档本地与 Notion + 写日志（不推飞书）
+- test-list   ：只读测试 X List 与 Cookie 连通性，不写 run.log 或 last_context.txt
 
 写稿规范在同目录 prompt.md，由 Antigravity Sidecar 定时任务读取。
 """
@@ -27,7 +28,10 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "shared"))
 from bot_utils import (already_ran_today, load_sent_urls, url_key,
                        make_logger, make_pending_saver, proxy_ok,
-                       emit_fetch_output, send_x_linked_report)
+                       emit_fetch_output, send_x_linked_report,
+                       sanitize_html, extract_hrefs, X_POST_RE,
+                       extract_report_date, archive_and_sync_notion,
+                       record_sent_urls)
 
 BASE = Path(__file__).parent
 LOG_FILE = BASE / "logs" / "run.log"
@@ -65,8 +69,8 @@ def _proxy_ok() -> bool:
 
 
 def _load_plist_env_if_needed() -> None:
-    """直接运行 test-list 时从 LaunchAgent plist 补全环境变量（不覆盖已存在变量）。"""
-    global _PROXY, FEISHU_WEBHOOK, WINDOW_H, LIST_SCAN_LIMIT, INCLUDE_REPLIES
+    """直接运行 test-list / archive-only 时从 LaunchAgent plist 补全环境变量（不覆盖已存在变量）。"""
+    global _PROXY, FEISHU_WEBHOOK, PER_BUILDER_CAP, WINDOW_H, LIST_SCAN_LIMIT, INCLUDE_REPLIES
     if not PLIST_PATH.exists():
         return
     try:
@@ -78,6 +82,7 @@ def _load_plist_env_if_needed() -> None:
                 os.environ[k] = str(v)
         _PROXY = os.getenv("HTTPS_PROXY") or os.getenv("HTTP_PROXY") or _PROXY
         FEISHU_WEBHOOK = os.getenv("FEISHU_WEBHOOK", FEISHU_WEBHOOK)
+        PER_BUILDER_CAP = int(os.getenv("BUILDER_PER_ACCOUNT_CAP", str(PER_BUILDER_CAP)))
         WINDOW_H = int(os.getenv("BUILDER_WINDOW_H", str(WINDOW_H)))
         LIST_SCAN_LIMIT = int(os.getenv("BUILDER_LIST_SCAN_LIMIT", str(LIST_SCAN_LIMIT)))
         INCLUDE_REPLIES = os.getenv("BUILDER_INCLUDE_REPLIES", "0") == "1"
@@ -122,24 +127,52 @@ def _cookie_dict_from_env() -> dict[str, str]:
     return parsed
 
 
-def _format_tweet_text(t) -> str:
-    """展开 t.co 链接，并补充 X Article 标题与引用推文正文。"""
-    text = (t.rawContent or "").strip()
-    for lk in getattr(t, "links", None) or []:
+_TCO_RE = re.compile(r"https?://t\.co/[A-Za-z0-9]+")
+
+
+def _expand_links(raw_text: str, links) -> str:
+    """展开推文中的 t.co 短链，并剔除残留媒体/引用卡片 t.co 尾巴。"""
+    text = (raw_text or "").strip()
+    for lk in links or []:
         tco = getattr(lk, "tcourl", "") or ""
         dest = getattr(lk, "url", "") or ""
         if tco and dest and tco in text:
             text = text.replace(tco, dest)
+    text = _TCO_RE.sub("", text)
+    text = re.sub(r"[ \t]{2,}", " ", text)
+    return "\n".join(ln.rstrip() for ln in text.splitlines()).strip()
+
+
+def _format_tweet_text(t) -> str:
+    """展开 t.co 链接，并补充 X Article 标题/预览与引用推文正文。"""
+    text = _expand_links(getattr(t, "rawContent", ""), getattr(t, "links", None))
 
     article = getattr(t, "article", None)
-    if article and getattr(article, "title", ""):
-        text = f"[X Article: {article.title}] {text}".strip()
+    if article:
+        a_title = (getattr(article, "title", "") or "").strip()
+        a_preview = (
+            getattr(article, "previewText", "")
+            or getattr(article, "summaryText", "")
+            or ""
+        ).strip()
+        header = f"[X Article: {a_title}]" if a_title else "[X Article]"
+        if a_preview and a_preview not in text:
+            preview_snip = a_preview.replace("\n", " ")[:240]
+            if text:
+                text = f"{header} {text} | 摘要：{preview_snip}".strip()
+            else:
+                text = f"{header} {preview_snip}".strip()
+        elif a_title:
+            text = f"{header} {text}".strip()
 
     qt = getattr(t, "quotedTweet", None)
     if qt is not None:
         q_user = getattr(getattr(qt, "user", None), "username", "") or "unknown"
         q_url = getattr(qt, "url", "") or ""
-        q_text = (getattr(qt, "rawContent", "") or "").replace("\n", " ").strip()[:240]
+        q_text = _expand_links(
+            getattr(qt, "rawContent", ""),
+            getattr(qt, "links", None),
+        ).replace("\n", " ").strip()[:240]
         if q_text or q_url:
             text = f"{text}\n[引用 @{q_user} ({q_url})]: {q_text}".strip()
     return text
@@ -180,6 +213,9 @@ async def _ensure_twscrape_account(pool, account_name: str, cookie_map: dict[str
 async def _fetch_x_list_async(list_id: int, sent_before: set) -> tuple[list, dict]:
     """通过 twscrape 的 SearchTimeline (list:<id>) 抓取自建 X List 过去 WINDOW_H 小时推文。"""
     from twscrape import API, AccountsPool
+    from twscrape.logger import set_log_level
+
+    set_log_level("WARNING")
 
     account_name = (os.getenv("X_ACCOUNT_NAME") or "builder_alt").strip() or "builder_alt"
     cookie_map = _cookie_dict_from_env()
@@ -418,13 +454,93 @@ def run_send(draft_path: Path) -> int:
         link_label="原推")
 
 
+# ===== 模式 4：archive-only =====
+
+def run_archive_only(draft_path: Path) -> int:
+    """只读取并清洗草稿，写入本地归档 + 同步 Notion + 记录去重，不推送飞书。"""
+    if not draft_path.exists():
+        print(f"ERROR: 找不到草稿文件：{draft_path}", file=sys.stderr)
+        return 1
+    raw = draft_path.read_text(encoding="utf-8")
+    report = sanitize_html(raw).strip()
+    if not report:
+        print("ERROR: 草稿内容为空", file=sys.stderr)
+        return 1
+
+    hrefs = extract_hrefs(report)
+    x_links = [u for u in hrefs if X_POST_RE.search(u)]
+    if not x_links:
+        msg = "稿件里没有任何 x.com 原帖链接（格式须为 x.com/<user>/status/<id>），拒绝归档"
+        print(f"=== ARCHIVE_FAIL === {msg}", file=sys.stderr)
+        write_log("FAIL", msg)
+        return 1
+
+    doc_date = extract_report_date(report) or datetime.now().strftime("%Y-%m-%d")
+    meta_summary = ""
+    if FETCH_META.exists():
+        try:
+            meta = json.loads(FETCH_META.read_text(encoding="utf-8"))
+            if meta.get("fetch_date") == doc_date:
+                meta_summary = (meta.get("log_summary") or "").strip()
+        except Exception:
+            pass
+
+    _proxy_ok()
+    arch = archive_and_sync_notion(
+        report,
+        "🛠️ AI Builder",
+        date_str=doc_date,
+        archive_dir=LOG_FILE.parent / "archive",
+        archive_filename=f"{doc_date}.txt",
+    )
+    arch_json = json.dumps(arch, ensure_ascii=False, default=str) if isinstance(arch, dict) else str(arch)
+    print(f"ARCHIVE_RESULT: {arch_json}")
+
+    notion_ok = False
+    notion_detail = ""
+    if isinstance(arch, dict):
+        if "notion_ok" in arch:
+            notion_ok = bool(arch.get("notion_ok"))
+            notion_detail = str(arch.get("notion_url") or arch.get("notion_info") or arch.get("notion_error") or arch.get("notion_msg") or "")
+        elif isinstance(arch.get("notion"), dict):
+            n = arch["notion"]
+            notion_ok = bool(n.get("ok"))
+            notion_detail = str(n.get("url") or n.get("info") or n.get("msg") or n.get("error") or "")
+        elif isinstance(arch.get("notion"), (tuple, list)) and len(arch["notion"]) >= 1:
+            notion_ok = bool(arch["notion"][0])
+            notion_detail = str(arch["notion"][1]) if len(arch["notion"]) > 1 else ""
+        elif "ok" in arch:
+            notion_ok = bool(arch.get("ok"))
+            notion_detail = str(arch.get("url") or arch.get("res") or arch.get("error") or "")
+        elif "notion.so/" in arch_json:
+            notion_ok = True
+            notion_detail = arch_json
+
+    if not notion_ok:
+        prefix = f"{meta_summary} | " if meta_summary else ""
+        err_msg = f"{prefix}Notion 单独归档失败 | Notion ✗ ({notion_detail or arch_json})"
+        write_log("WARN", err_msg)
+        print(f"=== ARCHIVE_FAIL === {err_msg}", file=sys.stderr)
+        return 1
+
+    record_sent_urls(SENT_URLS, x_links)
+    prefix = f"{meta_summary} | " if meta_summary else ""
+    status_line = f"{prefix}Notion 单独归档成功 | Notion ✓ {notion_detail}".strip()
+    write_log("OK", status_line)
+    print(f"=== ARCHIVE_OK === {status_line}")
+    return 0
+
+
 if __name__ == "__main__":
+    _load_plist_env_if_needed()
     parser = argparse.ArgumentParser(description="AI Builder 日报")
-    parser.add_argument("--mode", choices=["fetch", "send", "test-list"], required=True)
+    parser.add_argument("--mode", choices=["fetch", "send", "test-list", "archive-only"], required=True)
     parser.add_argument("--draft", default=str(DRAFT_FILE))
     args = parser.parse_args()
     if args.mode == "fetch":
         sys.exit(run_fetch())
     if args.mode == "test-list":
         sys.exit(run_test_list())
+    if args.mode == "archive-only":
+        sys.exit(run_archive_only(Path(args.draft)))
     sys.exit(run_send(Path(args.draft)))
